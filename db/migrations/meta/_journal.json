@@ -15,6 +15,13 @@
       "when": 1740106379886,
       "tag": "0001_luxuriant_purifiers",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1740112762615,
+      "tag": "0002_superb_richard_fisk",
+      "breakpoints": true
     }
   ]
 }
