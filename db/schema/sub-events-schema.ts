@@ -1,20 +1,21 @@
 /**
  * @description
  * This file defines the database schema for storing sub-events (sessions, talks, etc.) within a parent event.
- * Each row in `subEventsTable` represents a sub-event that belongs to a specific record in `eventsTable`.
  *
- * Key features:
- * - Stores session-level details such as sub-event name, times, speaker, topic, etc.
- * - References the `eventsTable` so sub-events can be cascaded on event deletion.
- * - Includes timestamps (createdAt, updatedAt) with automatic updates on changes.
+ * Key changes:
+ * - `startTime` and `endTime` are now `text(...)` columns instead of `timestamp(...)`.
+ *   This lets us store strings like "4-5 pm" directly, without parsing them as dates.
  *
- * @dependencies
- * - drizzle-orm/pg-core: For defining table schema, columns, references.
- * - types: InsertSubEvent and SelectSubEvent are exported for typed usage elsewhere.
+ * We still have:
+ * - speaker, speakerPosition, speakerCompany
+ * - location
+ * - No `topic` column
  *
  * @notes
- * - `location` can override the parent event's location if sub-event has a specific location/room.
- * - The foreign key references the `eventsTable.id`.
+ * After updating this file, run:
+ *   npx drizzle-kit generate
+ *   npx drizzle-kit migrate
+ * to apply the migration that changes these columns from timestamp to text.
  */
 
 import { pgTable, uuid, text, timestamp, index } from "drizzle-orm/pg-core"
@@ -22,6 +23,7 @@ import { eventsTable } from "./events-schema"
 
 /**
  * The subEventsTable stores session-level data belonging to a parent event.
+ * We store times as raw strings in `startTime` and `endTime`.
  */
 export const subEventsTable = pgTable(
   "sub_events",
@@ -30,26 +32,30 @@ export const subEventsTable = pgTable(
     eventId: uuid("event_id")
       .references(() => eventsTable.id, { onDelete: "cascade" })
       .notNull(),
+
+    /**
+     * Updated: Now using text columns for start/end time
+     * so we can store raw strings like "4-5 pm"
+     */
+    startTime: text("start_time"),
+    endTime: text("end_time"),
+
     subEventName: text("sub_event_name"),
-    startTime: timestamp("start_time"),
-    endTime: timestamp("end_time"),
+
     speaker: text("speaker"),
-    topic: text("topic"),
+    speakerPosition: text("speaker_position"),
+    speakerCompany: text("speaker_company"),
+
     location: text("location"),
+
     createdAt: timestamp("created_at").defaultNow().notNull(),
     updatedAt: timestamp("updated_at")
       .defaultNow()
       .notNull()
       .$onUpdate(() => new Date())
   },
-  /**
-   * Table-level indexes for optimization.
-   */
   table => {
     return {
-      /**
-       * Index for quickly querying all sub-events belonging to a specific parent event.
-       */
       eventIdIdx: index("sub_events_event_id_idx").on(table.eventId)
     }
   }

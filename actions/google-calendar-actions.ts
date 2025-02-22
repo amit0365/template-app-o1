@@ -8,7 +8,8 @@
  * - Accepts timeMin and timeMax to limit the sync period.
  * - Stores or updates the event data in the `eventsTable`.
  * - Extracts external links (like Luma) from the event description.
- * - Refreshes the Google token if expired.
+ * - After inserting/updating an event that has a NEW or CHANGED externalLink, calls
+ *   `processExternalLinkAction` to scrape + parse sub-events.
  *
  * @dependencies
  * - db: Drizzle ORM instance for database operations
@@ -16,10 +17,12 @@
  * - profilesTable: For retrieving/storing user tokens
  * - InsertEvent, SelectEvent: Drizzle ORM types for typed insert/select
  * - ActionState<T>: Standard success/failure response for server actions
+ * - processExternalLinkAction: For scraping + GPT-4o parsing
  *
  * @notes
- * - If no timeMin/timeMax provided, defaults to "now" -> "now + 30 days" example logic (or any default).
- * - In production, handle edge cases carefully (e.g., invalid dates).
+ * - If no timeMin/timeMax provided, defaults to "now" -> "now + 30 days" example logic.
+ * - We handle partial scraping/parse errors by logging a warning but continuing the overall sync.
+ * - If the link is unchanged, we do NOT attempt to re-parse it automatically here.
  */
 
 "use server"
@@ -29,26 +32,8 @@ import { eventsTable, InsertEvent } from "@/db/schema/events-schema"
 import { profilesTable } from "@/db/schema/profiles-schema"
 import { eq, and } from "drizzle-orm"
 import { ActionState } from "@/types"
+import { processExternalLinkAction } from "@/actions/external-data-actions"
 
-/**
- * syncCalendarEventsAction
- * ------------------------
- * Fetches events in [timeMin, timeMax] from a user's Google Calendar and upserts them into the `eventsTable`.
- *
- * @async
- * @function
- * @param {string} userId - The Clerk user ID of the currently logged-in user.
- * @param {Date | null} timeMin - Lower bound for the event fetch window (inclusive).
- * @param {Date | null} timeMax - Upper bound for the event fetch window (inclusive).
- * @returns {Promise<ActionState<void>>}
- *    isSuccess: True if sync succeeded, false otherwise.
- *
- * Flow:
- * 1. Retrieve the user's Google tokens from `profilesTable`.
- * 2. Refresh the token if expired.
- * 3. Fetch events from Google Calendar in [timeMin, timeMax].
- * 4. Upsert each event into the DB, scanning description for external links.
- */
 export async function syncCalendarEventsAction(
   userId: string,
   timeMin: Date | null,
@@ -93,7 +78,6 @@ export async function syncCalendarEventsAction(
     }
 
     // 3. Determine timeMin/timeMax if not provided
-    //    In this example, if not provided, default to now -> now+30 days.
     const now = new Date()
     const defaultTimeMin = now
     const defaultTimeMax = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000)
@@ -144,9 +128,18 @@ export async function syncCalendarEventsAction(
         )
       })
 
+      let finalEventId: string | null = null
+      let linkIsNewOrChanged = false
+
       if (existing) {
-        // Update existing
-        await db
+        // Compare externalLink to see if it's changed
+        linkIsNewOrChanged =
+          eventData.externalLink !== null &&
+          eventData.externalLink !== undefined &&
+          eventData.externalLink !== existing.externalLink
+
+        // Update existing event
+        const [updatedEvent] = await db
           .update(eventsTable)
           .set({
             eventTitle: eventData.eventTitle,
@@ -156,9 +149,36 @@ export async function syncCalendarEventsAction(
             externalLink: eventData.externalLink || null
           })
           .where(eq(eventsTable.id, existing.id))
+          .returning()
+
+        if (updatedEvent) {
+          finalEventId = updatedEvent.id
+        }
       } else {
         // Insert new
-        await db.insert(eventsTable).values(eventData)
+        const [newEvent] = await db.insert(eventsTable).values(eventData).returning()
+        if (newEvent) {
+          finalEventId = newEvent.id
+          linkIsNewOrChanged = !!newEvent.externalLink
+        }
+      }
+
+      // 6. If we have a new or changed external link, call processExternalLinkAction
+      if (finalEventId && linkIsNewOrChanged) {
+        try {
+          const parseResult = await processExternalLinkAction(finalEventId)
+          if (!parseResult.isSuccess) {
+            console.warn(
+              `Scrape/parse failed for event ${finalEventId}:`,
+              parseResult.message
+            )
+          }
+        } catch (scrapeError) {
+          console.warn(
+            `Unexpected error calling processExternalLinkAction:`,
+            scrapeError
+          )
+        }
       }
     }
 
@@ -270,8 +290,6 @@ async function refreshGoogleToken(refreshToken: string): Promise<string | null> 
       return null
     }
 
-    // Typically you'd also store the new token in DB with updated expiry
-    // For brevity, we're just returning it here
     return tokenData.access_token
   } catch (error) {
     console.error("Error refreshing Google token:", error)
