@@ -43,6 +43,27 @@
       "when": 1740190920796,
       "tag": "0005_bouncy_ironclad",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1740280345457,
+      "tag": "0006_gray_firebrand",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1740290838134,
+      "tag": "0007_massive_dakota_north",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1740291503487,
+      "tag": "0008_brainy_morph",
+      "breakpoints": true
     }
   ]
 }

@@ -1,30 +1,3 @@
-/**
- * @description
- * Provides a server action to sync Google Calendar events for a user's primary calendar,
- * optionally within a specified date range (timeMin -> timeMax).
- *
- * Key features:
- * - Fetches events from the user's Google Calendar using stored OAuth tokens.
- * - Accepts timeMin and timeMax to limit the sync period.
- * - Stores or updates the event data in the `eventsTable`.
- * - Extracts external links (like Luma) from the event description.
- * - After inserting/updating an event that has a NEW or CHANGED externalLink, calls
- *   `processExternalLinkAction` to scrape + parse sub-events.
- *
- * @dependencies
- * - db: Drizzle ORM instance for database operations
- * - eventsTable: Schema definition for storing top-level events
- * - profilesTable: For retrieving/storing user tokens
- * - InsertEvent, SelectEvent: Drizzle ORM types for typed insert/select
- * - ActionState<T>: Standard success/failure response for server actions
- * - processExternalLinkAction: For scraping + GPT-4o parsing
- *
- * @notes
- * - If no timeMin/timeMax provided, defaults to "now" -> "now + 30 days" example logic.
- * - We handle partial scraping/parse errors by logging a warning but continuing the overall sync.
- * - If the link is unchanged, we do NOT attempt to re-parse it automatically here.
- */
-
 "use server"
 
 import { db } from "@/db/db"
@@ -34,17 +7,21 @@ import { eq, and } from "drizzle-orm"
 import { ActionState } from "@/types"
 import { processExternalLinkAction } from "@/actions/external-data-actions"
 
+/**
+ * syncCalendarEventsAction
+ * ------------------------
+ * Syncs events from Google, storing only the "date" portion (ignoring clock time).
+ */
 export async function syncCalendarEventsAction(
   userId: string,
   timeMin: Date | null,
   timeMax: Date | null
 ): Promise<ActionState<void>> {
   try {
-    // 1. Check user profile for Google tokens
+    // 1) Check user profile for Google tokens
     const userProfile = await db.query.profiles.findFirst({
       where: eq(profilesTable.userId, userId)
     })
-
     if (!userProfile) {
       return {
         isSuccess: false,
@@ -59,7 +36,7 @@ export async function syncCalendarEventsAction(
       }
     }
 
-    // 2. Possibly refresh the token if we believe it's expired
+    // 2) Possibly refresh token if expired
     let accessToken = userProfile.googleAccessToken
     if (
       userProfile.googleTokenExpires &&
@@ -77,21 +54,19 @@ export async function syncCalendarEventsAction(
       accessToken = newToken
     }
 
-    // 3. Determine timeMin/timeMax if not provided
+    // 3) Time range for the calendar query
     const now = new Date()
     const defaultTimeMin = now
     const defaultTimeMax = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000)
-
     const usedTimeMin = timeMin ?? defaultTimeMin
     const usedTimeMax = timeMax ?? defaultTimeMax
 
-    // 4. Fetch events from Google Calendar
+    // 4) Fetch events from Google
     const googleEvents = await fetchGoogleCalendarEvents(accessToken, {
       timeMin: usedTimeMin.toISOString(),
       timeMax: usedTimeMax.toISOString(),
       maxResults: 100
     })
-
     if (!googleEvents || !Array.isArray(googleEvents.items)) {
       return {
         isSuccess: false,
@@ -99,28 +74,40 @@ export async function syncCalendarEventsAction(
       }
     }
 
-    // 5. Upsert each event
+    // 5) Upsert each event
     for (const item of googleEvents.items) {
-      if (!item.id || !item.summary) {
-        continue
-      }
-      const description = item.description || ""
+      if (!item.id || !item.summary) continue
+
+      const description = item.description ?? ""
       const foundLink = extractFirstLink(description)
 
-      // Prepare event data
+      // Build our date object from either "start.dateTime" or "start.date"
+      let dateOnly: Date | null = null
+
+      if (item.start?.dateTime) {
+        // For time-based events, let's parse the dateTime
+        const dt = new Date(item.start.dateTime)
+        // Zero out hours to keep only the day portion
+        dt.setHours(0, 0, 0, 0)
+        dateOnly = dt
+      } else if (item.start?.date) {
+        // For all-day events, parse date directly (e.g. "2025-05-18")
+        dateOnly = new Date(item.start.date)
+      }
+
       const eventData: InsertEvent = {
         userId,
         eventTitle: item.summary,
         calendarEventId: item.id,
-        startTime: item.start?.dateTime
-          ? new Date(item.start.dateTime)
-          : undefined,
-        endTime: item.end?.dateTime ? new Date(item.end.dateTime) : undefined,
+
+        // Our "startTime" date column
+        startTime: dateOnly ? dateOnly.toISOString() : null,
+
         location: item.location || null,
         externalLink: foundLink || null
       }
 
-      // Check if event for (userId, calendarEventId) exists
+      // Check if this event already exists
       const existing = await db.query.events.findFirst({
         where: and(
           eq(eventsTable.userId, userId),
@@ -132,22 +119,13 @@ export async function syncCalendarEventsAction(
       let linkIsNewOrChanged = false
 
       if (existing) {
-        // Compare externalLink to see if it's changed
         linkIsNewOrChanged =
           eventData.externalLink !== null &&
-          eventData.externalLink !== undefined &&
           eventData.externalLink !== existing.externalLink
 
-        // Update existing event
         const [updatedEvent] = await db
           .update(eventsTable)
-          .set({
-            eventTitle: eventData.eventTitle,
-            startTime: eventData.startTime,
-            endTime: eventData.endTime,
-            location: eventData.location || null,
-            externalLink: eventData.externalLink || null
-          })
+          .set(eventData)
           .where(eq(eventsTable.id, existing.id))
           .returning()
 
@@ -155,7 +133,6 @@ export async function syncCalendarEventsAction(
           finalEventId = updatedEvent.id
         }
       } else {
-        // Insert new
         const [newEvent] = await db.insert(eventsTable).values(eventData).returning()
         if (newEvent) {
           finalEventId = newEvent.id
@@ -163,7 +140,7 @@ export async function syncCalendarEventsAction(
         }
       }
 
-      // 6. If we have a new or changed external link, call processExternalLinkAction
+      // 6) If external link is new or changed, parse sub-events
       if (finalEventId && linkIsNewOrChanged) {
         try {
           const parseResult = await processExternalLinkAction(finalEventId)
@@ -184,7 +161,7 @@ export async function syncCalendarEventsAction(
 
     return {
       isSuccess: true,
-      message: `Google Calendar events synced successfully for ${usedTimeMin.toDateString()} to ${usedTimeMax.toDateString()}.`,
+      message: `Google Calendar events synced. Only date portion stored (${usedTimeMin.toDateString()} to ${usedTimeMax.toDateString()}).`,
       data: undefined
     }
   } catch (error) {
@@ -198,12 +175,7 @@ export async function syncCalendarEventsAction(
 
 /**
  * fetchGoogleCalendarEvents
- * -------------------------
- * Calls the Google Calendar API to retrieve events in [timeMin, timeMax] for the primary calendar.
- *
- * @param {string} accessToken - The user's Google OAuth access token
- * @param {object} options - Query parameters: timeMin, timeMax, maxResults, etc.
- * @returns {Promise<any | null>} - The JSON response from Google or null on failure.
+ *  - standard function to call the Google Calendar API
  */
 async function fetchGoogleCalendarEvents(
   accessToken: string,
@@ -241,11 +213,7 @@ async function fetchGoogleCalendarEvents(
 
 /**
  * refreshGoogleToken
- * ------------------
- * If the access token is expired, try to refresh it using the refresh token.
- *
- * @param {string} refreshToken - The stored Google refresh token for the user.
- * @returns {Promise<string | null>} - New access token or null if refresh fails.
+ *  - same old function to refresh the token if expired
  */
 async function refreshGoogleToken(refreshToken: string): Promise<string | null> {
   if (!refreshToken) {
@@ -299,11 +267,7 @@ async function refreshGoogleToken(refreshToken: string): Promise<string | null> 
 
 /**
  * extractFirstLink
- * ----------------
- * Scans the text for the first http:// or https:// link and returns it. Otherwise null.
- *
- * @param {string} text - The text to scan (event description).
- * @returns {string | null} - Found link or null if none found.
+ *  - parse the first http(s) link from a string
  */
 function extractFirstLink(text: string): string | null {
   const linkRegex = /(https?:\/\/[^\s]+)/i

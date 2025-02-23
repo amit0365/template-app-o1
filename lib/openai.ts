@@ -73,7 +73,7 @@ const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1/chat/completions"
 export async function callOpenAiApi(
   messages: OpenAiChatMessage[],
   model: string = "gpt-4",
-  temperature: number = 0.7
+  temperature: number = 0.0
 ): Promise<string> {
   const apiKey = process.env.OPENAI_API_KEY
   if (!apiKey) {

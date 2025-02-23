@@ -1,30 +1,3 @@
-/**
- * @description
- * A server component that fetches all events for the logged-in user along with each event's sub-events.
- * It then passes the combined data to a client component for displaying in a timeline.
- *
- * Key features:
- * - Auth check with Clerk; if not signed in, user is prompted to log in.
- * - Fetches the user's events from our eventsTable via `getEventsAction`.
- * - For each event, fetches its sub-events via `getSubEventsByEventAction`.
- * - Constructs a `UserEventWithSubs` array for the client component.
- * - Uses a Suspense boundary to handle async data fetching gracefully.
- *
- * @dependencies
- * - auth from "@clerk/nextjs/server": to retrieve the userId
- * - getEventsAction from "@/db/event-actions": fetch top-level user events
- * - getSubEventsByEventAction from "@/db/sub-events-actions": fetch sub-events for each event
- * - TimelineClient from "./_components/timeline": client component that displays the final timeline
- *
- * @notes
- * - Step 8 in the plan: "Display Events & SubEvents in UI"
- * - We store `startTime` and `endTime` for top-level events as Date objects in the DB.
- * - For sub-events, `startTime` and `endTime` are strings that can contain human-readable time ranges.
- *   We simply pass them through as-is for display.
- * - If 2+ events overlap, we highlight them in the timeline client component.
- *   Overlap detection is done in the client code, checking the event-level times (Dates).
- */
-
 "use server"
 
 import { Suspense } from "react"
@@ -33,88 +6,116 @@ import { notFound } from "next/navigation"
 
 import { getEventsAction } from "@/db/event-actions"
 import { getSubEventsByEventAction } from "@/db/sub-events-actions"
-import { TimelineClient } from "./_components/timeline"
+import Timeline from "./_components/timeline"
 
-interface UserEventWithSubs {
+interface SubEventWithParent {
   id: string
-  eventTitle: string
-  startTime: Date | null
-  endTime: Date | null
-  location?: string | null
-  externalLink?: string | null
-  subEvents: Array<{
-    id: string
-    subEventName?: string | null
-    startTime?: string | null
-    endTime?: string | null
-    speaker?: string | null
-    speakerPosition?: string | null
-    speakerCompany?: string | null
-    location?: string | null
-  }>
+  subEventName: string
+  speaker: string
+  speakerPosition: string
+  speakerCompany: string
+  parentEventTitle: string
+  parentLocation: string
+  parentLink: string
+  /**
+   * The parent main event's date (startTime) from your DB, e.g. 2025-05-18 (no time).
+   */
+  parentDate: Date | null
+  /**
+   * Sub-event start/end as real Date objects, after combining subEvent’s
+   * textual time ("9am") with the parent's date. Possibly null if parse fails.
+   */
+  start: Date | null
+  end: Date | null
+}
+
+/**
+ * parseSubEventTime
+ * -----------------
+ * Merges a date (parentDate) + a 12-hour time (e.g. "9am") into a full Date.
+ * Returns null if parsing fails or if no parentDate/time is provided.
+ */
+function parseSubEventTime(parentDate: Date | null, subTime: string | null) {
+  if (!parentDate || !subTime) return null
+
+  const match = subTime.trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$/i)
+  if (!match) return null
+
+  let hour = parseInt(match[1], 10)
+  const minute = match[2] ? parseInt(match[2], 10) : 0
+  const ampm = match[3].toLowerCase()
+
+  if (ampm === "pm" && hour < 12) {
+    hour += 12
+  } else if (ampm === "am" && hour === 12) {
+    hour = 0
+  }
+
+  const dateTime = new Date(parentDate.getTime())
+  dateTime.setHours(hour, minute, 0, 0)
+  return dateTime
 }
 
 /**
  * SchedulePage
  * ------------
- * Our main server component for displaying a user's schedule (events + sub-events).
- *
- * @returns JSX element that wraps the client timeline in a Suspense boundary.
+ * Server component that:
+ * 1) Checks auth,
+ * 2) Fetches all main events,
+ * 3) For each event, fetches sub-events,
+ * 4) Converts sub-event "4pm" strings to real Date objects by combining with `event.startTime`,
+ * 5) Passes them all to a single client timeline component.
  */
 export default async function SchedulePage() {
-  // 1) Check authentication
+  // 1) Auth
   const { userId } = await auth()
-  if (!userId) {
-    // If not logged in, we can show a 404, or a custom "Please sign in" message.
-    // We'll just return notFound() to simplify.
-    return notFound()
-  }
+  if (!userId) return notFound()
 
-  // 2) Fetch the user's events
+  // 2) Get all main events
   const eventsRes = await getEventsAction(userId)
-  if (!eventsRes.isSuccess) {
-    // In a real app, you might show an error message. We'll just return notFound().
-    return notFound()
-  }
+  if (!eventsRes.isSuccess) return notFound()
+  const mainEvents = eventsRes.data
 
-  const userEvents = eventsRes.data // Array of SelectEvent
+  // 3) Gather sub-events from each main event
+  const allSubs: SubEventWithParent[] = []
 
-  // 3) For each event, fetch sub-events
-  const eventsWithSubs: UserEventWithSubs[] = []
-  for (const ev of userEvents) {
-    const subEventRes = await getSubEventsByEventAction(ev.id)
-    let subEvents = []
-    if (subEventRes.isSuccess) {
-      subEvents = subEventRes.data.map(subev => ({
-        id: subev.id,
-        subEventName: subev.subEventName ?? null,
-        startTime: subev.startTime ?? null,
-        endTime: subev.endTime ?? null,
-        speaker: subev.speaker ?? null,
-        speakerPosition: (subev as any).speakerPosition ?? null, // might be in the DB
-        speakerCompany: (subev as any).speakerCompany ?? null,
-        location: subev.location ?? null
-      }))
+  for (const event of mainEvents) {
+    const subRes = await getSubEventsByEventAction(event.id)
+    if (!subRes.isSuccess) continue
+
+    for (const sub of subRes.data) {
+      const parentDate = event.startTime ? new Date(event.startTime) : null
+      const startDateTime = parseSubEventTime(parentDate, sub.startTime)
+      const endDateTime = parseSubEventTime(parentDate, sub.endTime)
+
+      allSubs.push({
+        id: sub.id,
+        subEventName: sub.subEventName ?? "Untitled",
+        speaker: sub.speaker ?? "",
+        speakerPosition: sub.speakerPosition ?? "",
+        speakerCompany: sub.speakerCompany ?? "",
+        parentEventTitle: event.eventTitle,
+        parentLocation: event.location ?? "",
+        parentLink: event.externalLink ?? "",
+        parentDate: parentDate, // The main event's date
+        start: startDateTime,
+        end: endDateTime
+      })
     }
-
-    eventsWithSubs.push({
-      id: ev.id,
-      eventTitle: ev.eventTitle,
-      startTime: ev.startTime ? new Date(ev.startTime) : null,
-      endTime: ev.endTime ? new Date(ev.endTime) : null,
-      location: ev.location,
-      externalLink: ev.externalLink,
-      subEvents
-    })
   }
 
-  // 4) Render the timeline in a Suspense boundary
+  // 4) Sort all sub-events by start time so the client can handle them in order
+  allSubs.sort((a, b) => {
+    if (a.start && b.start) return a.start.getTime() - b.start.getTime()
+    if (a.start && !b.start) return -1
+    if (!a.start && b.start) return 1
+    return 0
+  })
+
+  // 5) Render in a Suspense boundary
   return (
-    <Suspense fallback={<p className="p-6">Loading schedule...</p>}>
-      {/* 
-        We pass `eventsWithSubs` to the client component to handle sorting, overlap, etc.
-      */}
-      <TimelineClient events={eventsWithSubs} />
+    <Suspense fallback={<div className="p-4">Loading schedule...</div>}>
+      <Timeline subEvents={allSubs} />
     </Suspense>
   )
 }

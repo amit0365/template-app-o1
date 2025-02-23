@@ -1,15 +1,18 @@
 /**
  * @description
  * A server action that uses GPT-4o (e.g. "gpt-4o-mini") to parse event details (location, sub-events, speakers)
- * from raw text. 
+ * from raw text.
  *
- * Key changes:
- * - We removed the date/time parsing logic. We simply store the raw strings from GPT into `startTime`/`endTime`.
- * - `startTime`/`endTime` are text columns in the DB, so we can store "4-5 pm", "4:00 PM", or any free-form string.
- * - No time-range logic or skipping sub-events for invalid times. 
- * - We still do chunking if text > 100k chars, to avoid token limits.
- * - We still store speakerPosition and speakerCompany if GPT provides them.
+ * Key changes in this version:
+ * - We specifically instruct GPT to produce sub-event times in a 12-hour format with am/pm,
+ *   such as "9am" or "4:30pm", with no date or offset.
+ * - We still store these times as text in the DB.
+ * - All other logic (chunking, speaker parsing, etc.) remains the same.
  * - We strip triple backticks if GPT encloses the JSON in code fences (```json ... ```).
+ *
+ * -- Deduplication change --
+ * After aggregating sub-events from all chunks, we call `deduplicateSubEvents(subEvents)`
+ * which ensures that if `title, startTime, and endTime` match, we only keep one copy.
  */
 
 "use server"
@@ -24,9 +27,10 @@ import { InsertSubEvent } from "@/db/schema/sub-events-schema"
  * GPTSubEvent
  * -----------
  * The shape we want from GPT for each sub-event:
- *  - "speakerPosition", "speakerCompany" for speaker details
- *  - No "topic" field
- *  - `startTime` & `endTime` stay as strings, e.g. "4-5 pm"
+ *  - "startTime", "endTime" => short 12-hour times (e.g. "9am", "4:30pm")
+ *  - "title" => name/title of the sub-event
+ *  - "speaker", "speakerPosition", "speakerCompany" => optional speaker details
+ *  - "location" => optional location
  */
 interface GPTSubEvent {
   startTime?: string
@@ -36,6 +40,7 @@ interface GPTSubEvent {
   speakerPosition?: string
   speakerCompany?: string
   location?: string
+  eventId?: string
 }
 
 /**
@@ -72,7 +77,9 @@ function chunkText(text: string, maxLen: number): string[] {
  * ----------------
  * Calls GPT with a system prompt describing sub-event fields:
  *   "startTime, endTime, title, speaker, speakerPosition, speakerCompany, location"
- * No "topic" field. Then we strip any triple backticks to avoid JSON parse errors.
+ * We specifically instruct GPT to return times in a 12-hour format with am/pm.
+ *
+ * Then we strip any triple backticks to avoid JSON parse errors.
  */
 async function parseSingleChunk(
   eventId: string,
@@ -102,19 +109,22 @@ Return valid JSON with the following structure:
   ]
 }
 
-No other fields. Do not return "topic".
-If the speaker has details like "(Position @ Company)", you can 
-split them into "speakerPosition" and "speakerCompany" as best as possible. 
-If unknown, make them empty strings or null. 
-Output must be strictly JSON, no extra commentary.
+Important:
+- "startTime" and "endTime" MUST be 12-hour times with am/pm.
+  Examples: "9am", "4:30pm", "11:05am".
+- No date, no time zone offset, no 24-hour format.
+- If unknown, make them empty strings or null.
+- If the speaker has details like "(Position @ Company)", you can
+  split them into "speakerPosition" and "speakerCompany" as best as possible.
+- Output must be strictly JSON, with NO extra commentary or code blocks.
 `
     },
     {
       role: "user",
       content: `
 Chunk #${chunkIndex} for event ID ${eventId}.
-Parse the following partial text into the JSON format. 
-If uncertain, do your best with this partial chunk. 
+Parse the following partial text into the JSON format.
+If uncertain, do your best with 12-hour times.
 Text:
 """ 
 ${chunk}
@@ -123,10 +133,10 @@ ${chunk}
     }
   ]
 
-  // 1) Call GPT for a chunk
+  // 1) Call GPT for this chunk
   let rawResponse = await callOpenAiApi(messages, "gpt-4o-mini", 0.7)
 
-  // 2) Strip triple backticks if GPT used code fences (```json ... ```)
+  // 2) Strip triple backticks if GPT used code fences
   rawResponse = rawResponse.replace(/^```(\w+)?\n?/, "").replace(/```$/, "")
 
   // 3) Parse the JSON
@@ -142,12 +152,36 @@ ${chunk}
 }
 
 /**
+ * deduplicateSubEvents
+ * --------------------
+ * Removes duplicates if (title, startTime, endTime) match (case-insensitive).
+ */
+function deduplicateSubEvents(subEvents: GPTSubEvent[]): GPTSubEvent[] {
+  const uniqueMap = new Map<string, GPTSubEvent>()
+
+  for (const se of subEvents) {
+    const speaker = (se.speaker ?? "").trim().toLowerCase()
+    const start = (se.startTime ?? "").trim().toLowerCase()
+    const end = (se.endTime ?? "").trim().toLowerCase()
+    // Build a composite key
+    const key = `${speaker}||${start}||${end}`
+
+    if (!uniqueMap.has(key)) {
+      uniqueMap.set(key, se)
+    }
+    // else: we skip it since it's considered a duplicate
+  }
+
+  return Array.from(uniqueMap.values())
+}
+
+/**
  * parseEventDetailsAction
  * -----------------------
  * Main server action. If rawText <= 100k chars, parse once. Else, chunk it.
  * Merges subEvents from each chunk, then calls handleParsedSchedule to do DB insertion.
  *
- * Key difference: We do NOT parse times as Date objects. We store them as raw strings.
+ * We store the raw 12-hour times as text in the DB. No date/time parsing here.
  */
 export async function parseEventDetailsAction(
   eventId: string,
@@ -155,9 +189,16 @@ export async function parseEventDetailsAction(
 ): Promise<ActionState<void>> {
   try {
     const MAX_CHARS_PER_CHUNK = 100_000
+
     if (rawText.length <= MAX_CHARS_PER_CHUNK) {
       // single chunk parse
       const singleResult = await parseSingleChunk(eventId, rawText, 1)
+
+      // Deduplicate subEvents from single chunk
+      if (singleResult.subEvents) {
+        singleResult.subEvents = deduplicateSubEvents(singleResult.subEvents)
+      }
+
       await handleParsedSchedule(eventId, singleResult, 1)
       return {
         isSuccess: true,
@@ -192,6 +233,9 @@ export async function parseEventDetailsAction(
       }
     }
 
+    // Deduplicate across all chunks
+    fullSubEvents = deduplicateSubEvents(fullSubEvents)
+
     // final schedule object
     const merged: GPTParsedSchedule = {
       location: eventLocation,
@@ -220,7 +264,7 @@ export async function parseEventDetailsAction(
  * 1) Looks up the parent event for location merging
  * 2) Possibly updates parent's location from GPT if 'parsed.location'
  * 3) Inserts each subEvent into DB, storing times as raw strings (no date parsing).
- *    - If subEvent's startTime/endTime is empty, we store null. 
+ *    - If subEvent's startTime/endTime is empty, we store null.
  */
 async function handleParsedSchedule(
   eventId: string,
@@ -251,7 +295,7 @@ async function handleParsedSchedule(
 
   // insert each sub-event
   for (const gptSub of subEvents) {
-    // No date parsing. We simply store the raw strings or null if empty.
+    // We do NOT parse times. We simply store the raw strings or null if empty.
     const start = gptSub.startTime?.trim() || null
     const end = gptSub.endTime?.trim() || null
 
@@ -266,7 +310,7 @@ async function handleParsedSchedule(
       finalLoc = childLoc
     }
 
-    // build the subEvent insertion with string times
+    // build the subEvent insertion data
     const subEventData: InsertSubEvent = {
       eventId,
       startTime: start,
@@ -275,7 +319,7 @@ async function handleParsedSchedule(
       speaker: gptSub.speaker?.trim() || null,
       speakerPosition: gptSub.speakerPosition?.trim() || null,
       speakerCompany: gptSub.speakerCompany?.trim() || null,
-      location: finalLoc || null
+      location: finalLoc || null,
     }
 
     try {
